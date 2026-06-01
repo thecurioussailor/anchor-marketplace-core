@@ -16,5 +16,7 @@ pub mod anchor_marketplace_core {
         ctx.accounts.init(name, fee, &ctx.bumps)
     }
 
-    
+    pub fn list(ctx: Context<List>, price: u64) -> Result<()> {
+        ctx.accounts.create_listing(price, &ctx.bumps)
+    }
 }
