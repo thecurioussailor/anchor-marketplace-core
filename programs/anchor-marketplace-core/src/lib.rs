@@ -29,4 +29,8 @@ pub mod anchor_marketplace_core {
     pub fn delist(ctx: Context<Delist>) -> Result<()> {
         ctx.accounts.delist()
     }
+
+    pub fn withdraw_fees(ctx: Context<WithdrawFees>, amount: u64) -> Result<()> {
+        ctx.accounts.withdraw_fees(amount)
+    }
 }
