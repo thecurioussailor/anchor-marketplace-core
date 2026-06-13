@@ -10,9 +10,12 @@ import {
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
+  createMint,
   getAccount,
   getAssociatedTokenAddressSync,
   getMint,
+  getOrCreateAssociatedTokenAccount,
+  mintTo,
 } from "@solana/spl-token";
 import { createUmi } from "@metaplex-foundation/umi-bundle-defaults";
 import {
@@ -78,6 +81,12 @@ describe("marketplace-core", () => {
   const listingPda = (asset: PublicKey) =>
     PublicKey.findProgramAddressSync(
       [Buffer.from("listing"), asset.toBuffer()],
+      program.programId
+    )[0];
+
+  const offerPda = (asset: PublicKey, buyer: PublicKey) =>
+    PublicKey.findProgramAddressSync(
+      [Buffer.from("offer"), asset.toBuffer(), buyer.toBuffer()],
       program.programId
     )[0];
 
@@ -153,6 +162,7 @@ describe("marketplace-core", () => {
         asset: listedAsset,
         collection: null,
         listing: listingPda(listedAsset),
+        paymentMint: null,
         mplCoreProgram: MPL_CORE_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
@@ -232,6 +242,7 @@ describe("marketplace-core", () => {
         asset,
         collection: null,
         listing: listingPda(asset),
+        paymentMint: null,
         mplCoreProgram: MPL_CORE_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
@@ -297,6 +308,7 @@ describe("marketplace-core", () => {
         asset,
         collection: null,
         listing: listingPda(asset),
+        paymentMint: null,
         mplCoreProgram: MPL_CORE_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
@@ -384,5 +396,385 @@ describe("marketplace-core", () => {
     } catch (err: any) {
       assert.include(err.toString(), "InvalidWithdrawAmount");
     }
+  });
+
+  describe("buy_with_token (SPL payment listings)", () => {
+    let paymentMint: PublicKey;
+    let tokenListedAsset: PublicKey;
+    const tokenPrice = new BN(1_000_000); // 1 token at 6 decimals
+
+    before(async () => {
+      paymentMint = await createMint(
+        connection,
+        providerKeypair,
+        providerKeypair.publicKey,
+        null,
+        6
+      );
+
+      const takerAta = await getOrCreateAssociatedTokenAccount(
+        connection,
+        providerKeypair,
+        paymentMint,
+        taker.publicKey
+      );
+      await mintTo(
+        connection,
+        providerKeypair,
+        paymentMint,
+        takerAta.address,
+        providerKeypair,
+        10_000_000
+      );
+    });
+
+    it("lists an asset priced in an SPL token", async () => {
+      tokenListedAsset = await createCoreAsset(maker.publicKey);
+
+      await program.methods
+        .list(tokenPrice)
+        .accountsPartial({
+          maker: maker.publicKey,
+          asset: tokenListedAsset,
+          collection: null,
+          listing: listingPda(tokenListedAsset),
+          paymentMint,
+          mplCoreProgram: MPL_CORE_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([maker])
+        .rpc();
+
+      const listing = await program.account.listing.fetch(
+        listingPda(tokenListedAsset)
+      );
+      assert.equal(listing.price.toString(), tokenPrice.toString());
+      assert.equal(listing.paymentMint.toBase58(), paymentMint.toBase58());
+
+      const asset = await fetchAssetV1(umi, umiPublicKey(tokenListedAsset.toBase58()));
+      assert.equal(asset.owner.toString(), listingPda(tokenListedAsset).toBase58());
+    });
+
+    it("lets a taker buy the listing with the SPL token", async () => {
+      const takerPaymentAta = getAssociatedTokenAddressSync(
+        paymentMint,
+        taker.publicKey
+      );
+      const makerPaymentAta = getAssociatedTokenAddressSync(
+        paymentMint,
+        maker.publicKey
+      );
+      const treasuryTokenAccount = getAssociatedTokenAddressSync(
+        paymentMint,
+        marketplacePda,
+        true
+      );
+      const takerRewardsAta = getAssociatedTokenAddressSync(
+        rewardsMintPda,
+        taker.publicKey
+      );
+
+      const takerBefore = await getAccount(connection, takerPaymentAta);
+
+      await program.methods
+        .buyWithToken()
+        .accountsPartial({
+          taker: taker.publicKey,
+          maker: maker.publicKey,
+          asset: tokenListedAsset,
+          collection: null,
+          marketplace: marketplacePda,
+          listing: listingPda(tokenListedAsset),
+          paymentMint,
+          takerPaymentAta,
+          makerPaymentAta,
+          treasuryTokenAccount,
+          rewardsMint: rewardsMintPda,
+          takerRewardsAta,
+          mplCoreProgram: MPL_CORE_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([taker])
+        .rpc();
+
+      const asset = await fetchAssetV1(umi, umiPublicKey(tokenListedAsset.toBase58()));
+      assert.equal(asset.owner.toString(), taker.publicKey.toBase58());
+
+      const listingAfter = await program.account.listing.fetchNullable(
+        listingPda(tokenListedAsset)
+      );
+      assert.isNull(listingAfter, "listing should be closed");
+
+      const expectedFee = tokenPrice.muln(fee).divn(10_000).toNumber();
+      const expectedMakerAmount = tokenPrice.toNumber() - expectedFee;
+
+      const takerAfter = await getAccount(connection, takerPaymentAta);
+      const makerAfter = await getAccount(connection, makerPaymentAta);
+      const treasuryAfter = await getAccount(connection, treasuryTokenAccount);
+
+      assert.equal(
+        (takerBefore.amount - takerAfter.amount).toString(),
+        tokenPrice.toString()
+      );
+      assert.equal(makerAfter.amount.toString(), expectedMakerAmount.toString());
+      assert.equal(treasuryAfter.amount.toString(), expectedFee.toString());
+
+      // taker already holds 1 reward token from the earlier SOL `buy` test
+      const rewards = await getAccount(connection, takerRewardsAta);
+      assert.equal(rewards.amount.toString(), "2");
+    });
+
+    it("lets admin withdraw SPL treasury fees", async () => {
+      const treasuryTokenAccount = getAssociatedTokenAddressSync(
+        paymentMint,
+        marketplacePda,
+        true
+      );
+      const adminTokenAccount = getAssociatedTokenAddressSync(
+        paymentMint,
+        admin.publicKey
+      );
+
+      const treasuryBefore = await getAccount(connection, treasuryTokenAccount);
+      assert.isAbove(
+        Number(treasuryBefore.amount),
+        0,
+        "treasury token account should have accumulated fees"
+      );
+
+      const amount = treasuryBefore.amount;
+
+      await program.methods
+        .withdrawTokenFees(new BN(amount.toString()))
+        .accountsPartial({
+          admin: admin.publicKey,
+          marketplace: marketplacePda,
+          paymentMint,
+          treasuryTokenAccount,
+          adminTokenAccount,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([admin])
+        .rpc();
+
+      const treasuryAfter = await getAccount(connection, treasuryTokenAccount);
+      const adminAfter = await getAccount(connection, adminTokenAccount);
+      assert.equal(treasuryAfter.amount.toString(), "0");
+      assert.equal(adminAfter.amount.toString(), amount.toString());
+    });
+
+    it("rejects unauthorized and zero-amount SPL withdrawals", async () => {
+      const intruder = Keypair.generate();
+      await fund(intruder.publicKey, 1);
+
+      const treasuryTokenAccount = getAssociatedTokenAddressSync(
+        paymentMint,
+        marketplacePda,
+        true
+      );
+      const intruderTokenAccount = getAssociatedTokenAddressSync(
+        paymentMint,
+        intruder.publicKey
+      );
+      const adminTokenAccount = getAssociatedTokenAddressSync(
+        paymentMint,
+        admin.publicKey
+      );
+
+      try {
+        await program.methods
+          .withdrawTokenFees(new BN(1))
+          .accountsPartial({
+            admin: intruder.publicKey,
+            marketplace: marketplacePda,
+            paymentMint,
+            treasuryTokenAccount,
+            adminTokenAccount: intruderTokenAccount,
+            associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            systemProgram: SystemProgram.programId,
+          })
+          .signers([intruder])
+          .rpc();
+        assert.fail("expected non-admin withdraw to be rejected");
+      } catch (err: any) {
+        assert.include(err.toString(), "ConstraintHasOne");
+      }
+
+      try {
+        await program.methods
+          .withdrawTokenFees(new BN(0))
+          .accountsPartial({
+            admin: admin.publicKey,
+            marketplace: marketplacePda,
+            paymentMint,
+            treasuryTokenAccount,
+            adminTokenAccount,
+            associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            systemProgram: SystemProgram.programId,
+          })
+          .signers([admin])
+          .rpc();
+        assert.fail("expected zero-amount withdraw to be rejected");
+      } catch (err: any) {
+        assert.include(err.toString(), "InvalidWithdrawAmount");
+      }
+    });
+  });
+
+  describe("offers (make_offer / accept_offer / cancel_offer)", () => {
+    let offerAsset: PublicKey;
+    const listPriceForOffer = new BN(2 * LAMPORTS_PER_SOL);
+    const offerAmount = new BN(1.5 * LAMPORTS_PER_SOL);
+
+    before(async () => {
+      offerAsset = await createCoreAsset(maker.publicKey);
+
+      await program.methods
+        .list(listPriceForOffer)
+        .accountsPartial({
+          maker: maker.publicKey,
+          asset: offerAsset,
+          collection: null,
+          listing: listingPda(offerAsset),
+          paymentMint: null,
+          mplCoreProgram: MPL_CORE_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([maker])
+        .rpc();
+    });
+
+    it("lets a buyer make an offer (escrowing SOL)", async () => {
+      await program.methods
+        .makeOffer(offerAmount)
+        .accountsPartial({
+          buyer: taker.publicKey,
+          asset: offerAsset,
+          offer: offerPda(offerAsset, taker.publicKey),
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([taker])
+        .rpc();
+
+      const offer = await program.account.offer.fetch(
+        offerPda(offerAsset, taker.publicKey)
+      );
+      assert.equal(offer.buyer.toBase58(), taker.publicKey.toBase58());
+      assert.equal(offer.asset.toBase58(), offerAsset.toBase58());
+      assert.equal(offer.amount.toString(), offerAmount.toString());
+
+      const offerBalance = await connection.getBalance(
+        offerPda(offerAsset, taker.publicKey)
+      );
+      assert.isAtLeast(offerBalance, offerAmount.toNumber());
+    });
+
+    it("lets the maker accept the offer", async () => {
+      const buyerRewardsAta = getAssociatedTokenAddressSync(
+        rewardsMintPda,
+        taker.publicKey
+      );
+
+      const makerBefore = await connection.getBalance(maker.publicKey);
+      const treasuryBefore = await connection.getBalance(treasuryPda);
+      const buyerBefore = await connection.getBalance(taker.publicKey);
+
+      await program.methods
+        .acceptOffer()
+        .accountsPartial({
+          maker: maker.publicKey,
+          buyer: taker.publicKey,
+          asset: offerAsset,
+          collection: null,
+          marketplace: marketplacePda,
+          listing: listingPda(offerAsset),
+          offer: offerPda(offerAsset, taker.publicKey),
+          treasury: treasuryPda,
+          rewardsMint: rewardsMintPda,
+          buyerRewardsAta,
+          mplCoreProgram: MPL_CORE_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([maker])
+        .rpc();
+
+      const asset = await fetchAssetV1(umi, umiPublicKey(offerAsset.toBase58()));
+      assert.equal(asset.owner.toString(), taker.publicKey.toBase58());
+
+      const listingAfter = await program.account.listing.fetchNullable(
+        listingPda(offerAsset)
+      );
+      assert.isNull(listingAfter, "listing should be closed");
+
+      const offerAfter = await program.account.offer.fetchNullable(
+        offerPda(offerAsset, taker.publicKey)
+      );
+      assert.isNull(offerAfter, "offer should be closed");
+
+      const expectedFee = offerAmount.muln(fee).divn(10_000).toNumber();
+      const expectedMakerDelta = offerAmount.toNumber() - expectedFee;
+
+      const makerAfter = await connection.getBalance(maker.publicKey);
+      const treasuryAfter = await connection.getBalance(treasuryPda);
+      const buyerAfter = await connection.getBalance(taker.publicKey);
+
+      // maker also reclaims the closed listing account's rent on top of
+      // the offer payout
+      assert.isAtLeast(makerAfter - makerBefore, expectedMakerDelta);
+      assert.equal(treasuryAfter - treasuryBefore, expectedFee);
+      // buyer gets back the offer-account rent (escrow minus the
+      // amount that was paid out to maker/treasury)
+      assert.isAbove(buyerAfter, buyerBefore);
+
+      // taker has accumulated 2 rewards from earlier buy / buy_with_token
+      // tests, plus 1 more from this accept_offer
+      const rewards = await getAccount(connection, buyerRewardsAta);
+      assert.equal(rewards.amount.toString(), "3");
+    });
+
+    it("lets a buyer cancel an offer and reclaim escrowed SOL", async () => {
+      const cancelAsset = await createCoreAsset(maker.publicKey);
+      const cancelAmount = new BN(0.5 * LAMPORTS_PER_SOL);
+
+      await program.methods
+        .makeOffer(cancelAmount)
+        .accountsPartial({
+          buyer: taker.publicKey,
+          asset: cancelAsset,
+          offer: offerPda(cancelAsset, taker.publicKey),
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([taker])
+        .rpc();
+
+      const buyerBefore = await connection.getBalance(taker.publicKey);
+
+      await program.methods
+        .cancelOffer()
+        .accountsPartial({
+          buyer: taker.publicKey,
+          asset: cancelAsset,
+          offer: offerPda(cancelAsset, taker.publicKey),
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([taker])
+        .rpc();
+
+      const buyerAfter = await connection.getBalance(taker.publicKey);
+      assert.isAbove(buyerAfter, buyerBefore, "buyer should reclaim escrowed SOL");
+
+      const offerAfter = await program.account.offer.fetchNullable(
+        offerPda(cancelAsset, taker.publicKey)
+      );
+      assert.isNull(offerAfter, "offer should be closed");
+    });
   });
 });

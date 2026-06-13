@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_spl::token_interface::Mint;
 use mpl_core::{instructions::TransferV1CpiBuilder, ID as MPL_CORE_ID};
 
 use crate::state::Listing;
@@ -25,6 +26,9 @@ pub struct List<'info> {
     )]
     pub listing: Account<'info, Listing>,
 
+    /// Mint the listing is priced in. Omit for a SOL-denominated listing.
+    pub payment_mint: Option<InterfaceAccount<'info, Mint>>,
+
     /// CHECK: pinned to the mpl-core program id
     #[account(address = MPL_CORE_ID)]
     pub mpl_core_program: UncheckedAccount<'info>,
@@ -38,6 +42,7 @@ impl<'info> List<'info> {
             maker: self.maker.key(),
             asset: self.asset.key(),
             price,
+            payment_mint: self.payment_mint.as_ref().map(|m| m.key()).unwrap_or_default(),
             bump: bumps.listing,
         });
 
